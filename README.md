@@ -3,7 +3,7 @@
 PlanetScale logo for the [Omarchy](https://omarchy.org) bar. Click the logo to open a panel with:
 
 - database state, deploy requests, and branch metrics
-- 24-hour query latency (p99 and p50) for the slowest patterns
+- branch-wide latency (p50, p95, p99, p99.9, max) and query rate (QPS and QPM) for the last full minute
 - query errors
 - a **Copy host, user, and password** action that puts a `.env` block on the clipboard
 
@@ -15,6 +15,8 @@ Right-click opens the database in the browser. Middle-click refreshes. In the pa
 omarchy plugin add https://github.com/LukasCaha/omarchy-planetscale --enable
 ```
 
+`barMetric` is the number after the logo: `p50`, `p95`, `p99`, `p999`, `max`, `qps`, or `qpm`.
+
 The plugin id is `lukascaha.planetscale`. Set your database on that entry in `~/.config/omarchy/shell.json`:
 
 ```json
@@ -23,7 +25,8 @@ The plugin id is `lukascaha.planetscale`. Set your database on that entry in `~/
   "organization": "your-org",
   "database": "your-database",
   "branch": "main",
-  "refreshIntervalSec": 60
+  "refreshIntervalSec": 60,
+  "barMetric": "p99"
 }
 ```
 

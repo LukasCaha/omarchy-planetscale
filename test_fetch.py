@@ -170,45 +170,46 @@ class PresenceTests(unittest.TestCase):
         self.assertIn("…", payload["tooltip"])
         self.assertLess(len(payload["tooltip"].split("4 errors · ", 1)[1]), 90)
 
-    def test_latency_insights_rank_by_p99(self):
-        long_sql = "select " + ("slow_column_" * 8) + " from events where id = ?"
-        payload = fetch.compose(
-            ready_database(),
-            deploys([]),
-            empty_metrics(),
-            empty_insights(),
-            "acme",
-            "main",
-            insights([
+    def test_collective_latency_and_query_rate(self):
+        now = 1_000_000
+        original = fetch.time.time
+        fetch.time.time = lambda: now
+        try:
+            payload = fetch.compose(
+                ready_database(),
+                deploys([]),
+                empty_metrics(),
+                empty_insights(),
+                "acme",
+                "main",
                 {
-                    "p99_latency": 40.2,
-                    "p50_latency": 12.4,
-                    "max_latency": 80,
-                    "query_count": 100,
-                    "rows_read_per_query": 1.5,
-                    "normalized_sql": "select 1",
+                    "ok": True,
+                    "status": 200,
+                    "data": {
+                        "interval": 60,
+                        "series": [
+                            {"metric": "latency_p50", "points": [[now - 120, 1.06], [now - 10, 9]]},
+                            {"metric": "latency_p95", "points": [[now - 120, 1.69], [now - 10, 9]]},
+                            {"metric": "latency_p99", "points": [[now - 120, 2.78], [now - 10, 50]]},
+                            {"metric": "latency_p999", "points": [[now - 120, 3.98], [now - 10, 80]]},
+                            {"metric": "latency_max", "points": [[now - 120, 3.98], [now - 10, 80]]},
+                            {"metric": "queries", "points": [[now - 120, 120], [now - 10, 9999]]},
+                            {"metric": "queries", "points": [[now - 120, 135], [now - 10, 1]]},
+                        ],
+                    },
                 },
-                {
-                    "p99_latency": 2500,
-                    "p50_latency": 800,
-                    "max_latency": 4000,
-                    "query_count": 1,
-                    "rows_read_per_query": 20,
-                    "normalized_sql": long_sql,
-                },
-            ]),
-        )
-        rows = payload["insightRows"]
-        self.assertEqual(rows[0]["p99"], "2.5s")
-        self.assertEqual(rows[0]["p50"], "800ms")
-        self.assertIn("1 run", rows[0]["detail"])
-        self.assertIn("20 rows/query", rows[0]["detail"])
-        self.assertIn("max 4.0s", rows[0]["detail"])
-        self.assertTrue(rows[0]["sql"].endswith("…"))
-        self.assertEqual(rows[1]["p99"], "40.2ms")
-        self.assertEqual(rows[1]["p50"], "12.4ms")
-        self.assertIn("p99 2.5s · p50 800ms", payload["tooltip"])
-        self.assertLess(rows[1]["p99"].find("select"), 0)
+            )
+        finally:
+            fetch.time.time = original
+        by_id = {row["id"]: row for row in payload["insightRows"]}
+        self.assertEqual(by_id["p99"]["value"], "2.8ms")
+        self.assertEqual(by_id["p99"]["pin"], "p99 2.8ms")
+        self.assertEqual(by_id["p50"]["value"], "1.1ms")
+        self.assertEqual(by_id["qps"]["value"], "4.2/s")
+        self.assertEqual(by_id["qps"]["pin"], "4.2 qps")
+        self.assertEqual(by_id["qpm"]["value"], "255/min")
+        self.assertIn("p99: 2.8ms", payload["tooltip"])
+        self.assertNotIn("9999", payload["tooltip"])
 
     def test_env_text_quotes_password(self):
         text = fetch.env_text("app", {

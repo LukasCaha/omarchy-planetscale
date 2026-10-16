@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -432,46 +433,89 @@ def format_count(value):
     return f"{number:.1f}"
 
 
-def latency_rows(latency):
-    if not latency:
+COLLECTIVE_LATENCY = (
+    ("p50", "latency_p50", "p50"),
+    ("p95", "latency_p95", "p95"),
+    ("p99", "latency_p99", "p99"),
+    ("p999", "latency_p999", "p99.9"),
+    ("max", "latency_max", "max"),
+)
+QUERY_METRIC_NAMES = [name for _key, name, _label in COLLECTIVE_LATENCY] + ["queries"]
+
+
+def _finished_value(points, interval, now=None):
+    usable = []
+    for point in points or []:
+        if not isinstance(point, (list, tuple)) or len(point) < 2 or point[1] is None:
+            continue
+        usable.append(point)
+    if not usable:
+        return None
+    current = time.time() if now is None else now
+    step = interval or 60
+    if len(usable) >= 2 and usable[-1][0] + step > current + 1:
+        return usable[-2][1]
+    return usable[-1][1]
+
+
+def _combined_metric(payload, name, interval, aggregate):
+    values = []
+    for series in (payload or {}).get("series") or []:
+        if series.get("metric") != name:
+            continue
+        value = _finished_value(series.get("points"), interval)
+        if value is not None:
+            values.append(float(value))
+    if not values:
+        return None
+    if aggregate == "sum":
+        return sum(values)
+    return max(values)
+
+
+def _rate_text(value):
+    if value >= 10:
+        return str(int(round(value)))
+    if value >= 1:
+        return f"{value:.1f}".rstrip("0").rstrip(".")
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def collective_rows(section):
+    if not section:
         return []
-    if not latency.get("ok"):
-        status = latency.get("status") or "error"
+    if not section.get("ok"):
+        status = section.get("status") or "error"
         return [{
-            "p99": "unavailable",
-            "p50": "",
-            "detail": f"HTTP {status}",
-            "sql": "",
+            "id": "p99",
+            "label": "p99",
+            "value": f"unavailable (HTTP {status})",
+            "pin": "",
         }]
-    rows = list((latency.get("data") or {}).get("data") or [])
-    ranked = sorted(rows, key=lambda row: float(row.get("p99_latency") or 0), reverse=True)
-    if not ranked:
-        return [{
-            "p99": "none",
-            "p50": "",
-            "detail": "No queries in the last 24 hours",
-            "sql": "",
-        }]
-    shown = []
-    for row in ranked[:3]:
-        count = row.get("query_count")
-        rows_per_query = row.get("rows_read_per_query")
-        parts = []
-        if count is not None:
-            runs = int(count)
-            parts.append(f"{runs} run" if runs == 1 else f"{runs} runs")
-        if rows_per_query is not None:
-            parts.append(f"{format_count(rows_per_query)} rows/query")
-        maximum = row.get("max_latency")
-        if maximum is not None:
-            parts.append(f"max {format_latency(maximum)}")
-        shown.append({
-            "p99": format_latency(row.get("p99_latency")),
-            "p50": format_latency(row.get("p50_latency")),
-            "detail": " · ".join(parts),
-            "sql": _one_line(row.get("normalized_sql") or row.get("fingerprint") or "", 72),
+    payload = section.get("data") or {}
+    interval = payload.get("interval") or 60
+    rows = []
+    for key, name, label in COLLECTIVE_LATENCY:
+        value = _combined_metric(payload, name, interval, "max")
+        text = format_latency(value) if value is not None else "unavailable"
+        rows.append({
+            "id": key,
+            "label": label,
+            "value": text,
+            "pin": f"{label} {text}" if value is not None else "",
         })
-    return shown
+    queries = _combined_metric(payload, "queries", interval, "sum")
+    if queries is None or interval <= 0:
+        rows.append({"id": "qps", "label": "QPS", "value": "unavailable", "pin": ""})
+        rows.append({"id": "qpm", "label": "QPM", "value": "unavailable", "pin": ""})
+        return rows
+    per_second = queries / interval
+    per_minute = queries / interval * 60
+    qps = _rate_text(per_second)
+    qpm = format_count(per_minute)
+    rows.append({"id": "qps", "label": "QPS", "value": f"{qps}/s", "pin": f"{qps} qps"})
+    rows.append({"id": "qpm", "label": "QPM", "value": f"{qpm}/min", "pin": f"{qpm} qpm"})
+    return rows
 
 
 def insight_lines(insights):
@@ -554,32 +598,25 @@ def _labeled_rows(lines):
     return rows
 
 
-def compose(database, deploys, metrics, insights, org, branch, latency=None):
+def compose(database, deploys, metrics, insights, org, branch, query_metrics=None):
     name = str(database.get("name") or "")
     state = state_lines(database)
     deploy = deploy_lines(deploys)
     metric = metric_lines(branch, metrics)
     query = insight_lines(insights)
-    slow = latency_rows(latency)
+    collective = collective_rows(query_metrics)
     schema = None
     for line in state:
         if line.startswith("Schema recommendations: "):
             schema = line.split(": ", 1)[1]
-    latency_lines = []
-    if slow:
-        latency_lines = ["Insights"]
-        for row in slow:
-            label = f"p99 {row['p99']}"
-            if row["p50"]:
-                label += f" · p50 {row['p50']}"
-            latency_lines.append(label)
-            if row["detail"]:
-                latency_lines.append(row["detail"])
-            if row["sql"]:
-                latency_lines.append(row["sql"])
+    insight_lines_out = []
+    if collective:
+        insight_lines_out = ["Insights"] + [
+            f"{row['label']}: {row['value']}" for row in collective
+        ]
     blocks = [state, deploy, metric, query]
-    if latency_lines:
-        blocks.append(latency_lines)
+    if insight_lines_out:
+        blocks.append(insight_lines_out)
     return {
         "name": name,
         "tone": tone_for(database, deploys),
@@ -594,7 +631,7 @@ def compose(database, deploys, metrics, insights, org, branch, latency=None):
         "metrics": _labeled_rows(metric[1:]),
         "querySummary": query[0].split(": ", 1)[1] if query else "",
         "queryDetail": query[1] if len(query) > 1 else "",
-        "insightRows": slow,
+        "insightRows": collective,
     }
 
 
@@ -615,12 +652,12 @@ def collect(token, org, database, branch):
         branch_path + "/insights",
         {"sort": "errorCount", "dir": "desc", "per_page": 25, "period": "1d"},
     )
-    latency = section(
+    query_metrics = section(
         token,
-        branch_path + "/insights",
-        {"sort": "p99Latency", "dir": "desc", "per_page": 8, "period": "1d"},
+        branch_path + "/metrics",
+        {"metrics[]": QUERY_METRIC_NAMES, "period": "15m"},
     )
-    return compose(payload, deploys, metrics, insights, org, branch, latency)
+    return compose(payload, deploys, metrics, insights, org, branch, query_metrics)
 
 
 def credential_cache_path():

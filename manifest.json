@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "lukascaha.planetscale",
   "name": "PlanetScale",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "LukasCaha",
   "license": "MIT",
   "description": "PlanetScale logo in the Omarchy bar. Click opens a panel with state, deploys, metrics, query latency, and a button that copies connection credentials.",
@@ -22,7 +22,8 @@
       "organization": "",
       "database": "",
       "branch": "main",
-      "refreshIntervalSec": 60
+      "refreshIntervalSec": 60,
+      "barMetric": "p99"
     },
     "schema": [
       {
@@ -54,6 +55,14 @@
         "max": 3600,
         "step": 30,
         "defaultValue": 60
+      },
+      {
+        "key": "barMetric",
+        "type": "enum",
+        "label": "Bar metric",
+        "description": "Shown after the logo. One of p50, p95, p99, p999, max, qps, or qpm.",
+        "options": ["p50", "p95", "p99", "p999", "max", "qps", "qpm"],
+        "defaultValue": "p99"
       }
     ]
   }

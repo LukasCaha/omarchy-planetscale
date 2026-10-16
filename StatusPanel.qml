@@ -376,53 +376,26 @@ Panel {
 
             PanelSeparator { width: parent.width; foreground: root.foreground }
             PanelSectionHeader {
-              text: "INSIGHTS · 24H"
+              text: "INSIGHTS"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
 
+            Text {
+              width: parent.width
+              text: "Branch totals, last full minute"
+              textFormat: Text.PlainText
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
             Repeater {
               model: root.insightRows
-              delegate: Column {
+              delegate: StatusRow {
                 required property var modelData
-                required property int index
-                width: insightsSection.width
-                spacing: Style.space(4)
-
-                Item {
-                  visible: index > 0
-                  width: parent.width
-                  height: Style.space(8)
-                }
-
-                StatusRow {
-                  visible: modelData.p99 !== ""
-                  label: "p99"
-                  value: modelData.p50 ? modelData.p99 + " · p50 " + modelData.p50 : modelData.p99
-                }
-
-                Text {
-                  visible: modelData.detail !== ""
-                  width: parent.width
-                  text: modelData.detail || ""
-                  textFormat: Text.PlainText
-                  wrapMode: Text.WordWrap
-                  horizontalAlignment: Text.AlignRight
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                Text {
-                  visible: modelData.sql !== ""
-                  width: parent.width
-                  text: modelData.sql || ""
-                  textFormat: Text.PlainText
-                  wrapMode: Text.WordWrap
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
+                label: modelData.label || ""
+                value: modelData.value || ""
               }
             }
           }

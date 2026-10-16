@@ -19,26 +19,45 @@ BarWidget {
       ? warnColor
       : (bar ? bar.barForeground : Color.foreground)
 
+  readonly property string barMetric: {
+    var value = setting("barMetric", "p99")
+    return value ? String(value) : "p99"
+  }
+  readonly property string pinText: {
+    var rows = panelItem && panelItem.status ? panelItem.status.insightRows : null
+    if (!rows) return ""
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i] && rows[i].id === barMetric) return rows[i].pin || ""
+    }
+    return ""
+  }
+
   function open() { if (panelItem) panelItem.open() }
   function close() { if (panelItem) panelItem.close() }
   function toggle() { if (panelItem) panelItem.toggle() }
   function closeForPopoutSwitch() { if (panelItem) panelItem.closeForPopoutSwitch() }
   function refresh() { if (panelItem) panelItem.refresh() }
+  function handlePress(buttonCode) {
+    if (buttonCode === Qt.RightButton) {
+      if (panelItem) panelItem.openDashboard()
+    } else if (buttonCode === Qt.MiddleButton) root.refresh()
+    else root.toggle()
+  }
 
   function injectPanel() {
     var target = panelItem
     if (!target) return
     if ("bar" in target) target.bar = root.bar
     if ("settings" in target) target.settings = root.settings
-    if ("anchorItem" in target) target.anchorItem = button
+    if ("anchorItem" in target) target.anchorItem = cluster
     if ("hostWidget" in target) target.hostWidget = root
   }
 
   onBarChanged: injectPanel()
   onSettingsChanged: injectPanel()
 
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
+  implicitWidth: cluster.implicitWidth
+  implicitHeight: cluster.implicitHeight
 
   IpcHandler {
     target: "lukascaha.planetscale"
@@ -59,26 +78,48 @@ BarWidget {
     }
   }
 
-  BarIconButton {
-    id: button
-    anchors.fill: parent
-    bar: root.bar
-    tooltipText: panelItem ? panelItem.tooltipText : "PlanetScale"
-    iconComponent: Component {
-      PlanetScaleLogo {
-        anchors.centerIn: parent
-        iconSize: Style.bar.iconCanvas
-        width: iconSize
-        height: iconSize
-        opticalScale: 0.75
-        color: root.logoColor
+  Row {
+    id: cluster
+    spacing: Style.space(4)
+
+    BarIconButton {
+      id: iconButton
+      bar: root.bar
+      tooltipText: panelItem ? panelItem.tooltipText : "PlanetScale"
+      iconComponent: Component {
+        PlanetScaleLogo {
+          anchors.centerIn: parent
+          iconSize: Style.bar.iconCanvas
+          width: iconSize
+          height: iconSize
+          opticalScale: 0.75
+          color: root.logoColor
+        }
       }
+      onPressed: function(buttonCode) { root.handlePress(buttonCode) }
     }
-    onPressed: function(buttonCode) {
-      if (buttonCode === Qt.RightButton) {
-        if (panelItem) panelItem.openDashboard()
-      } else if (buttonCode === Qt.MiddleButton) root.refresh()
-      else root.toggle()
+
+    Item {
+      visible: root.pinText !== ""
+      width: pinLabel.implicitWidth
+      height: iconButton.implicitHeight
+
+      Text {
+        id: pinLabel
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.pinText
+        textFormat: Text.PlainText
+        color: root.logoColor
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
+        cursorShape: Qt.PointingHandCursor
+        onPressed: function(mouse) { root.handlePress(mouse.button) }
+      }
     }
   }
 }
