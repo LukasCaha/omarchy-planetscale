@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "id": "lukascaha.planetscale",
+  "name": "PlanetScale",
+  "version": "1.0.0",
+  "author": "LukasCaha",
+  "license": "MIT",
+  "description": "PlanetScale logo in the Omarchy bar. Click opens a panel with state, deploys, metrics, query latency, and a button that copies connection credentials.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "widget.qml"
+  },
+  "barWidget": {
+    "displayName": "PlanetScale",
+    "description": "PlanetScale logo. Click for state, deploys, metrics, latency, and credentials.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "organization": "",
+      "database": "",
+      "branch": "main",
+      "refreshIntervalSec": 60
+    },
+    "schema": [
+      {
+        "key": "organization",
+        "type": "string",
+        "label": "Organization",
+        "description": "PlanetScale organization slug.",
+        "defaultValue": ""
+      },
+      {
+        "key": "database",
+        "type": "string",
+        "label": "Database",
+        "description": "Database name slug.",
+        "defaultValue": ""
+      },
+      {
+        "key": "branch",
+        "type": "string",
+        "label": "Branch",
+        "description": "Branch whose metrics and query errors are shown.",
+        "defaultValue": "main"
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 60
+      }
+    ]
+  }
+}
