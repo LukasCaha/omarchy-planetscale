@@ -3,7 +3,6 @@
 
 import json
 import os
-import subprocess
 import sys
 import time
 import urllib.error
@@ -13,11 +12,9 @@ from pathlib import Path
 
 API = "https://api.planetscale.com/v1"
 TOKEN_PATH = Path.home() / ".config" / "planetscale" / "bar-token"
-CREDENTIAL_PATH = Path.home() / ".config" / "planetscale" / "bar-credentials.json"
-PASSWORD_NAME = "omarchy-bar"
-PASSWORD_ROLE = "readwriter"
 SQL_LIMIT = 80
 DEPLOY_LIMIT = 5
+TOKEN_LIMIT = 400
 
 POSTGRES_METRICS = [
     "planetscale_pods_cpu_util_percentages",
@@ -84,7 +81,7 @@ def emit(payload):
     sys.stdout.write("\n")
 
 
-def error_payload(message, name):
+def error_payload(message, name, needs_token=False):
     return {
         "name": name or "PlanetScale",
         "tone": "bad",
@@ -100,16 +97,15 @@ def error_payload(message, name):
         "querySummary": "",
         "queryDetail": "",
         "insightRows": [],
+        "numbers": [],
+        "charts": [],
+        "needsToken": bool(needs_token),
     }
 
 
 def load_token(path):
     if not path.is_file():
-        raise ConfigError(
-            "No service token. Put TOKEN_ID:TOKEN in "
-            f"{path} and run chmod 600 on that file. The token needs "
-            "read_database, read_branch, and read_deploy_request."
-        )
+        raise ConfigError("No service token yet.")
     mode = path.stat().st_mode
     if mode & 0o077:
         raise ConfigError(
@@ -149,10 +145,7 @@ def request(token, path, query=None, body=None):
 
 def database_error(status):
     if status in (401, 403):
-        return (
-            "Unauthorized. The service token in "
-            f"{TOKEN_PATH} needs read_database on this database."
-        )
+        return "Unauthorized. Paste a service token that can read this database."
     if status == 404:
         return "Database not found."
     if status == 0:
@@ -199,39 +192,46 @@ def _latest_sum(payload, name):
     return total
 
 
-def fetch_metrics(token, org, database, branch):
+def fetch_metrics(token, org, database, branch, period):
+    period = normalize_period(period)
     instant = section(
         token,
         _branch_metrics(org, database, branch, "instant"),
         {"metrics[]": POSTGRES_METRICS},
     )
-    tablets = section(
+    tablets_now = section(
         token,
         _branch_metrics(org, database, branch, "tablets-instant"),
         {"metrics[]": VITESS_TABLET_METRICS},
     )
-    storage = section(
+    tablets = section(
         token,
         _branch_metrics(org, database, branch, "tablets"),
-        {"metrics[]": ["shard_storage_usage", "shard_storage_available"], "period": "15m"},
+        {"metrics[]": list(TABLET_SERIES), "period": period},
     )
     merged = []
     ok = False
     status = None
-    for part in (instant, tablets):
+    if tablets["ok"]:
+        ok = True
+        merged.extend(window_gauges(tablets["data"]))
+    for part in (instant, tablets_now):
         if part["ok"]:
             ok = True
             merged.extend(part["data"].get("metrics") or [])
         elif status is None and not part.get("unsupported"):
             status = part["status"]
     data = {"metrics": merged}
-    if storage["ok"]:
+    if tablets["ok"]:
         ok = True
-        data["disk_used_bytes"] = _latest_sum(storage["data"], "shard_storage_usage")
-        data["disk_free_bytes"] = _latest_sum(storage["data"], "shard_storage_available")
+        data["disk_used_bytes"] = _latest_sum(tablets["data"], "shard_storage_usage")
+        data["disk_free_bytes"] = _latest_sum(tablets["data"], "shard_storage_available")
     if not ok:
         return {"ok": False, "status": status or 0, "body": "", "data": {}}
-    return {"ok": True, "status": 200, "data": data}
+    result = {"ok": True, "status": 200, "data": data}
+    if tablets["ok"]:
+        result["tablets"] = tablets["data"]
+    return result
 
 
 def _values(metric):
@@ -323,19 +323,33 @@ def _lag_seconds(found):
     return None
 
 
-def metric_lines(branch, metrics_section):
-    header = f"Branch {branch}"
+def _number(metric_id, group, label, value, pin=""):
+    return {
+        "id": metric_id,
+        "group": group,
+        "label": label,
+        "value": value,
+        "pin": pin,
+    }
+
+
+def _measured(prefix, value):
+    if not value or "unavailable" in str(value):
+        return ""
+    return f"{prefix} {value}"
+
+
+def branch_metric_rows(metrics_section):
     if not metrics_section["ok"]:
         reason = "unavailable"
         if metrics_section["status"]:
             reason = f"unavailable (HTTP {metrics_section['status']})"
         return [
-            header,
-            f"Connections: {reason}",
-            f"CPU: {reason}",
-            f"Memory: {reason}",
-            f"Disk: {reason}",
-            f"Replica lag: {reason}",
+            _number("connections", "branch", "Connections", reason),
+            _number("cpu", "branch", "CPU", reason),
+            _number("memory", "branch", "Memory", reason),
+            _number("disk", "branch", "Disk", reason),
+            _number("lag", "branch", "Replica lag", reason),
         ]
     payload = metrics_section["data"] or {}
     found = _metric_map(payload)
@@ -350,24 +364,35 @@ def metric_lines(branch, metrics_section):
     lag = _lag_seconds(found) if lag_name else None
     used = payload.get("disk_used_bytes")
     free = payload.get("disk_free_bytes")
+    disk_pin = ""
     if used is not None or free is not None:
         parts = []
+        pin_parts = []
         if used is not None:
-            parts.append(f"{_format_bytes(used)} used")
+            used_text = _format_bytes(used)
+            parts.append(f"{used_text} used")
+            pin_parts.append(used_text)
         if free is not None:
-            parts.append(f"{_format_bytes(free)} free")
+            free_text = _format_bytes(free)
+            parts.append(f"{free_text} free")
+            pin_parts.append(free_text)
         disk_line = ", ".join(parts)
+        disk_pin = "disk " + "/".join(pin_parts)
     elif disk_name:
         disk_line = _format_number(disk_percent, "%")
+        disk_pin = _measured("disk", disk_line)
     else:
         disk_line = "unavailable"
+    connection_text = _format_number(connections, "") if connections is not None else "unavailable"
+    cpu_text = _format_number(cpu, "%") if cpu_name else "unavailable"
+    memory_text = _format_number(memory, "%") if memory_name else "unavailable"
+    lag_text = _format_number(lag, "s") if lag_name else "unavailable"
     return [
-        header,
-        "Connections: " + (_format_number(connections, "") if connections is not None else "unavailable"),
-        "CPU: " + (_format_number(cpu, "%") if cpu_name else "unavailable"),
-        "Memory: " + (_format_number(memory, "%") if memory_name else "unavailable"),
-        "Disk: " + disk_line,
-        "Replica lag: " + (_format_number(lag, "s") if lag_name else "unavailable"),
+        _number("connections", "branch", "Connections", connection_text, _measured("conn", connection_text)),
+        _number("cpu", "branch", "CPU", cpu_text, _measured("cpu", cpu_text)),
+        _number("memory", "branch", "Memory", memory_text, _measured("mem", memory_text)),
+        _number("disk", "branch", "Disk", disk_line, disk_pin),
+        _number("lag", "branch", "Replica lag", lag_text, _measured("lag", lag_text)),
     ]
 
 
@@ -441,36 +466,75 @@ COLLECTIVE_LATENCY = (
     ("max", "latency_max", "max"),
 )
 QUERY_METRIC_NAMES = [name for _key, name, _label in COLLECTIVE_LATENCY] + ["queries"]
+PERIODS = ("15m", "1h", "6h", "1d", "7d")
+DEFAULT_PERIOD = "1h"
+TABLET_SERIES = (
+    "primary_cpu_usage",
+    "primary_memory_usage",
+    "replication_lag",
+    "shard_storage_usage",
+    "shard_storage_available",
+)
 
 
-def _finished_value(points, interval, now=None):
+def normalize_period(value):
+    text = str(value or "").strip()
+    if text in PERIODS:
+        return text
+    return DEFAULT_PERIOD
+
+
+def _finished_points(points, interval, now=None):
     usable = []
     for point in points or []:
         if not isinstance(point, (list, tuple)) or len(point) < 2 or point[1] is None:
             continue
-        usable.append(point)
+        usable.append((point[0], float(point[1])))
     if not usable:
-        return None
+        return []
     current = time.time() if now is None else now
     step = interval or 60
     if len(usable) >= 2 and usable[-1][0] + step > current + 1:
-        return usable[-2][1]
-    return usable[-1][1]
+        return usable[:-1]
+    return usable
 
 
-def _combined_metric(payload, name, interval, aggregate):
-    values = []
+def _combined_metric(payload, name, interval, aggregate, now=None):
+    if aggregate == "rate":
+        buckets = {}
+        for series in (payload or {}).get("series") or []:
+            if series.get("metric") != name:
+                continue
+            for stamp, value in _finished_points(series.get("points"), interval, now):
+                buckets[stamp] = buckets.get(stamp, 0) + value
+        if not buckets or interval <= 0:
+            return None
+        return sum(buckets.values()) / (len(buckets) * interval)
+    means = []
     for series in (payload or {}).get("series") or []:
         if series.get("metric") != name:
             continue
-        value = _finished_value(series.get("points"), interval)
-        if value is not None:
-            values.append(float(value))
-    if not values:
+        points = _finished_points(series.get("points"), interval, now)
+        if points:
+            means.append(sum(value for _stamp, value in points) / len(points))
+    if not means:
         return None
-    if aggregate == "sum":
-        return sum(values)
-    return max(values)
+    return max(means)
+
+
+def window_gauges(payload, now=None):
+    interval = (payload or {}).get("interval") or 60
+    gauges = []
+    for name, role in (
+        ("primary_cpu_usage", "primary"),
+        ("primary_memory_usage", "primary"),
+        ("replication_lag", "replica"),
+    ):
+        value = _combined_metric(payload, name, interval, "mean", now)
+        if value is None:
+            continue
+        gauges.append({"metric": name, "values": [{"value": value, "role": role}]})
+    return gauges
 
 
 def _rate_text(value):
@@ -486,55 +550,60 @@ def collective_rows(section):
         return []
     if not section.get("ok"):
         status = section.get("status") or "error"
-        return [{
-            "id": "p99",
-            "label": "p99",
-            "value": f"unavailable (HTTP {status})",
-            "pin": "",
-        }]
+        return [_number("p99", "insights", "p99", f"unavailable (HTTP {status})")]
     payload = section.get("data") or {}
     interval = payload.get("interval") or 60
     rows = []
     for key, name, label in COLLECTIVE_LATENCY:
-        value = _combined_metric(payload, name, interval, "max")
+        value = _combined_metric(payload, name, interval, "mean")
         text = format_latency(value) if value is not None else "unavailable"
         rows.append({
             "id": key,
+            "group": "insights",
             "label": label,
             "value": text,
             "pin": f"{label} {text}" if value is not None else "",
         })
-    queries = _combined_metric(payload, "queries", interval, "sum")
-    if queries is None or interval <= 0:
-        rows.append({"id": "qps", "label": "QPS", "value": "unavailable", "pin": ""})
-        rows.append({"id": "qpm", "label": "QPM", "value": "unavailable", "pin": ""})
+    per_second = _combined_metric(payload, "queries", interval, "rate")
+    if per_second is None:
+        rows.append(_number("qps", "insights", "QPS", "unavailable"))
+        rows.append(_number("qpm", "insights", "QPM", "unavailable"))
         return rows
-    per_second = queries / interval
-    per_minute = queries / interval * 60
+    per_minute = per_second * 60
     qps = _rate_text(per_second)
     qpm = format_count(per_minute)
-    rows.append({"id": "qps", "label": "QPS", "value": f"{qps}/s", "pin": f"{qps} qps"})
-    rows.append({"id": "qpm", "label": "QPM", "value": f"{qpm}/min", "pin": f"{qpm} qpm"})
+    rows.append(_number("qps", "insights", "QPS", f"{qps}/s", f"qps {qps}/s"))
+    rows.append(_number("qpm", "insights", "QPM", f"{qpm}/min", f"qpm {qpm}/min"))
     return rows
 
 
-def insight_lines(insights):
+def query_report(insights):
     if not insights["ok"]:
         status = insights["status"] or "error"
-        return [f"Query errors: unavailable (HTTP {status})"]
+        summary = f"unavailable (HTTP {status})"
+        return {"summary": summary, "detail": "", "row": _number("errors", "queries", "Errors", summary)}
     rows = [
         row for row in ((insights["data"] or {}).get("data") or [])
         if (row.get("error_count") or 0) > 0
     ]
     if not rows:
-        return ["Query errors: none"]
+        return {
+            "summary": "none",
+            "detail": "",
+            "row": _number("errors", "queries", "Errors", "none", "errors 0"),
+        }
     worst = max(rows, key=lambda row: row.get("error_count") or 0)
     noun = "fingerprint" if len(rows) == 1 else "fingerprints"
     sql = _one_line(worst.get("normalized_sql") or worst.get("fingerprint") or "")
-    lines = [f"Query errors: {len(rows)} {noun}"]
+    summary = f"{len(rows)} {noun}"
+    detail = ""
     if sql:
-        lines.append(f"{int(worst.get('error_count') or 0)} errors · {sql}")
-    return lines
+        detail = f"{int(worst.get('error_count') or 0)} errors · {sql}"
+    return {
+        "summary": summary,
+        "detail": detail,
+        "row": _number("errors", "queries", "Errors", summary, f"errors {len(rows)}"),
+    }
 
 
 def state_lines(database):
@@ -582,6 +651,125 @@ def tone_for(database, deploys):
     return "warn" if state in WARN_STATES else "bad"
 
 
+CHART_POINTS = 48
+
+
+def _series_points(payload, name, interval, combine, now=None):
+    buckets = {}
+    for series in (payload or {}).get("series") or []:
+        if series.get("metric") != name:
+            continue
+        for stamp, value in _finished_points(series.get("points"), interval, now):
+            if stamp not in buckets:
+                buckets[stamp] = value
+            elif combine == "sum":
+                buckets[stamp] += value
+            else:
+                buckets[stamp] = max(buckets[stamp], value)
+    return [(stamp, buckets[stamp]) for stamp in sorted(buckets)]
+
+
+def _chart_number(value):
+    number = float(value)
+    if abs(number) >= 100:
+        return int(round(number))
+    if abs(number) >= 10:
+        return round(number, 1)
+    return round(number, 2)
+
+
+def _downsample(values, limit):
+    count = len(values)
+    if count <= limit:
+        return values
+    reduced = []
+    for index in range(limit):
+        start = int(index * count / limit)
+        end = int((index + 1) * count / limit)
+        chunk = [value for value in values[start:end] if value is not None]
+        if not chunk:
+            reduced.append(None)
+        else:
+            reduced.append(sum(chunk) / len(chunk))
+    return reduced
+
+
+def _chart(chart_id, label, unit, scale, payload, specs, transform=None, now=None):
+    if not payload:
+        return None
+    interval = payload.get("interval") or 60
+    raw = []
+    for series_id, metric, series_label, combine in specs:
+        points = _series_points(payload, metric, interval, combine, now)
+        if transform == "rate" and interval > 0:
+            points = [(stamp, value / interval) for stamp, value in points]
+        if points:
+            raw.append((series_id, series_label, points))
+    if not raw:
+        return None
+    stamps = sorted({stamp for _series_id, _label, points in raw for stamp, _value in points})
+    series = []
+    for series_id, series_label, points in raw:
+        lookup = dict(points)
+        values = _downsample([lookup.get(stamp) for stamp in stamps], CHART_POINTS)
+        numbers = []
+        kept = False
+        for value in values:
+            if value is None:
+                numbers.append(None)
+            else:
+                numbers.append(_chart_number(value))
+                kept = True
+        if kept:
+            series.append({"id": series_id, "label": series_label, "points": numbers})
+    if not series:
+        return None
+    return {"id": chart_id, "label": label, "unit": unit, "scale": scale, "series": series}
+
+
+def build_charts(query_payload, tablets_payload, now=None):
+    charts = []
+    latency = _chart(
+        "latency",
+        "Latency",
+        "ms",
+        "auto",
+        query_payload,
+        (
+            ("p50", "latency_p50", "p50", "max"),
+            ("p95", "latency_p95", "p95", "max"),
+            ("p99", "latency_p99", "p99", "max"),
+        ),
+        now=now,
+    )
+    queries = _chart(
+        "queries",
+        "Queries",
+        "/s",
+        "auto",
+        query_payload,
+        (("qps", "queries", "QPS", "sum"),),
+        transform="rate",
+        now=now,
+    )
+    host = _chart(
+        "host",
+        "Host",
+        "%",
+        "percent",
+        tablets_payload,
+        (
+            ("memory", "primary_memory_usage", "Memory", "max"),
+            ("cpu", "primary_cpu_usage", "CPU", "max"),
+        ),
+        now=now,
+    )
+    for chart in (latency, queries, host):
+        if chart:
+            charts.append(chart)
+    return charts
+
+
 def dashboard_url(database, org, name):
     html = str(database.get("html_url") or "")
     if html.startswith("https://"):
@@ -589,32 +777,36 @@ def dashboard_url(database, org, name):
     return f"https://app.planetscale.com/{urllib.parse.quote(org)}/{urllib.parse.quote(name)}"
 
 
-def _labeled_rows(lines):
-    rows = []
-    for line in lines:
-        label, separator, value = line.partition(": ")
-        if separator:
-            rows.append({"label": label, "value": value})
-    return rows
-
-
-def compose(database, deploys, metrics, insights, org, branch, query_metrics=None):
+def compose(database, deploys, metrics, insights, org, branch, query_metrics=None, period=DEFAULT_PERIOD):
     name = str(database.get("name") or "")
     state = state_lines(database)
     deploy = deploy_lines(deploys)
-    metric = metric_lines(branch, metrics)
-    query = insight_lines(insights)
+    branch_rows = branch_metric_rows(metrics)
+    metric = [f"Branch {branch}"] + [f"{row['label']}: {row['value']}" for row in branch_rows]
+    query = query_report(insights)
     collective = collective_rows(query_metrics)
+    query_payload = query_metrics.get("data") if query_metrics and query_metrics.get("ok") else None
+    tablets_payload = metrics.get("tablets") if isinstance(metrics, dict) else None
+    charts = build_charts(query_payload, tablets_payload)
     schema = None
     for line in state:
         if line.startswith("Schema recommendations: "):
             schema = line.split(": ", 1)[1]
+    numbers = []
+    if schema is not None:
+        numbers.append(_number("schema", "state", "Schema", schema, f"schema {schema}"))
+    numbers.extend(collective)
+    numbers.extend(branch_rows)
+    numbers.append(query["row"])
     insight_lines_out = []
     if collective:
         insight_lines_out = ["Insights"] + [
             f"{row['label']}: {row['value']}" for row in collective
         ]
-    blocks = [state, deploy, metric, query]
+    query_lines = [f"Query errors: {query['summary']}"]
+    if query["detail"]:
+        query_lines.append(query["detail"])
+    blocks = [state, deploy, metric, query_lines]
     if insight_lines_out:
         blocks.append(insight_lines_out)
     return {
@@ -628,14 +820,19 @@ def compose(database, deploys, metrics, insights, org, branch, query_metrics=Non
         "schemaRecommendations": schema,
         "branch": branch,
         "deployLines": deploy[1:],
-        "metrics": _labeled_rows(metric[1:]),
-        "querySummary": query[0].split(": ", 1)[1] if query else "",
-        "queryDetail": query[1] if len(query) > 1 else "",
+        "metrics": [{"label": row["label"], "value": row["value"]} for row in branch_rows],
+        "querySummary": query["summary"],
+        "queryDetail": query["detail"],
         "insightRows": collective,
+        "numbers": numbers,
+        "charts": charts,
+        "needsToken": False,
+        "period": normalize_period(period),
     }
 
 
-def collect(token, org, database, branch):
+def collect(token, org, database, branch, period=DEFAULT_PERIOD):
+    period = normalize_period(period)
     path = (
         f"/organizations/{urllib.parse.quote(org)}"
         f"/databases/{urllib.parse.quote(database)}"
@@ -643,164 +840,74 @@ def collect(token, org, database, branch):
     try:
         payload = request(token, path)
     except ApiError as exc:
-        return error_payload(database_error(exc.status), database)
+        return error_payload(
+            database_error(exc.status),
+            database,
+            needs_token=exc.status in (401, 403),
+        )
     branch_path = path + f"/branches/{urllib.parse.quote(branch)}"
     deploys = section(token, path + "/deploy-requests", {"state": "open", "per_page": 25})
-    metrics = fetch_metrics(token, org, database, branch)
+    metrics = fetch_metrics(token, org, database, branch, period)
     insights = section(
         token,
         branch_path + "/insights",
-        {"sort": "errorCount", "dir": "desc", "per_page": 25, "period": "1d"},
+        {"sort": "errorCount", "dir": "desc", "per_page": 25, "period": period},
     )
     query_metrics = section(
         token,
         branch_path + "/metrics",
-        {"metrics[]": QUERY_METRIC_NAMES, "period": "15m"},
+        {"metrics[]": QUERY_METRIC_NAMES, "period": period},
     )
-    return compose(payload, deploys, metrics, insights, org, branch, query_metrics)
+    return compose(payload, deploys, metrics, insights, org, branch, query_metrics, period)
 
 
-def credential_cache_path():
-    return Path(os.environ.get("PS_PLUGIN_CREDENTIAL_FILE", CREDENTIAL_PATH))
-
-
-def cache_key(org, database, branch):
-    return f"{org}/{database}/{branch}"
-
-
-def read_cache(path):
-    if not path.is_file():
-        return {}
-    if path.stat().st_mode & 0o077:
-        raise ConfigError(f"{path} is readable by other users. Run: chmod 600 {path}")
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def write_cache(path, data):
+def save_token(path, raw):
+    line = str(raw or "").strip()
+    if not line:
+        raise ConfigError("Paste a service token first.")
+    if any(character.isspace() for character in line) or len(line) > TOKEN_LIMIT:
+        raise ConfigError("Paste one line, TOKEN_ID:TOKEN, with no spaces.")
+    token_id, separator, secret = line.partition(":")
+    if not separator or not token_id or not secret:
+        raise ConfigError("Paste one line, TOKEN_ID:TOKEN, with no spaces.")
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data), encoding="utf-8")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(line + "\n", encoding="utf-8")
     temporary.chmod(0o600)
     temporary.replace(path)
     path.chmod(0o600)
 
 
-def env_text(database, record):
-    host = str(record.get("host") or "")
-    user = str(record.get("username") or "")
-    password = str(record.get("password") or "")
-    name = str(record.get("database") or database)
-    if not host or not user or not password:
-        raise ConfigError("PlanetScale did not return a host, username, and password.")
-    database_url = (
-        "mysql://"
-        f"{urllib.parse.quote(user, safe='')}:"
-        f"{urllib.parse.quote(password, safe='')}@"
-        f"{host}/{urllib.parse.quote(name, safe='')}"
-        "?ssl=" + urllib.parse.quote('{"rejectUnauthorized":true}', safe="")
-    )
-    return "\n".join([
-        f"DATABASE_HOST={host}",
-        f"DATABASE_NAME={name}",
-        f"DATABASE_USERNAME={user}",
-        f"DATABASE_PASSWORD={password}",
-        f"DATABASE_URL={database_url}",
-    ]) + "\n"
-
-
-def record_from_api(database, payload):
-    return {
-        "host": payload.get("access_host_url") or "",
-        "username": payload.get("username") or "",
-        "password": payload.get("plain_text") or "",
-        "database": database,
-        "role": payload.get("role") or PASSWORD_ROLE,
-    }
-
-
-def copy_to_clipboard(text):
-    try:
-        subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=True)
-    except (OSError, subprocess.CalledProcessError):
-        raise ConfigError("Could not copy to the clipboard.") from None
-
-
-def copy_credentials(token, org, database, branch, copier=None):
-    copier = copier or copy_to_clipboard
-    path = credential_cache_path()
-    cache = read_cache(path)
-    key = cache_key(org, database, branch)
-    stored = cache.get(key)
-    record = stored if isinstance(stored, dict) and stored.get("password") else None
-    created = False
-    if record is None:
-        branch_path = (
-            f"/organizations/{urllib.parse.quote(org)}"
-            f"/databases/{urllib.parse.quote(database)}"
-            f"/branches/{urllib.parse.quote(branch)}/passwords"
-        )
-        try:
-            created_payload = request(token, branch_path, body={
-                "name": PASSWORD_NAME,
-                "role": PASSWORD_ROLE,
-            })
-        except ApiError as exc:
-            if exc.status in (401, 403):
-                return {
-                    "ok": False,
-                    "message": (
-                        "Token cannot create a password. Add connect_production_branch "
-                        "(or connect_branch) and try again."
-                    ),
-                }
-            return {"ok": False, "message": f"Could not create a password (HTTP {exc.status})."}
-        record = record_from_api(database, created_payload)
-        if not record["password"]:
-            return {
-                "ok": False,
-                "message": "PlanetScale did not return a password. Create one in the dashboard instead.",
-            }
-        cache[key] = record
-        write_cache(path, cache)
-        created = True
-    copier(env_text(database, record))
-    if created:
-        return {
-            "ok": True,
-            "message": "Copied a new password. Paste it into your .env. It will not be shown again.",
-        }
-    return {"ok": True, "message": "Copied credentials. Paste them into your .env."}
-
-
 def main(argv):
-    copying = len(argv) == 5 and argv[4] == "--copy-credentials"
-    if len(argv) != 4 and not copying:
-        emit(error_payload("Usage: fetch.py ORG DATABASE BRANCH", "PlanetScale"))
+    saving = len(argv) == 2 and argv[1] == "--save-token"
+    if saving:
+        path = Path(os.environ.get("PS_PLUGIN_TOKEN_FILE", TOKEN_PATH))
+        raw = os.environ.pop("PS_PLUGIN_TOKEN_VALUE", "")
+        try:
+            save_token(path, raw)
+        except ConfigError as exc:
+            emit({"ok": False, "message": str(exc)})
+            return 0
+        emit({"ok": True, "message": "Saved the service token."})
+        return 0
+    if len(argv) not in (4, 5):
+        emit(error_payload("Usage: fetch.py ORG DATABASE BRANCH [PERIOD]", "PlanetScale"))
         return 0
     org, database, branch = argv[1], argv[2], argv[3]
+    period = normalize_period(argv[4] if len(argv) == 5 else DEFAULT_PERIOD)
     label = database or "PlanetScale"
     if not org or not database:
         message = "Set organization and database on the plugin entry in ~/.config/omarchy/shell.json."
-        emit({"ok": False, "message": message} if copying else error_payload(message, label))
+        emit(error_payload(message, label))
         return 0
     if not branch:
         branch = "main"
     try:
         token = load_token(Path(os.environ.get("PS_PLUGIN_TOKEN_FILE", TOKEN_PATH)))
     except ConfigError as exc:
-        emit({"ok": False, "message": str(exc)} if copying else error_payload(str(exc), label))
+        emit(error_payload(str(exc), label, needs_token=True))
         return 0
-    if copying:
-        try:
-            emit(copy_credentials(token, org, database, branch))
-        except ConfigError as exc:
-            emit({"ok": False, "message": str(exc)})
-        return 0
-    emit(collect(token, org, database, branch))
+    emit(collect(token, org, database, branch, period))
     return 0
 
 

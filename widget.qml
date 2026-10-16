@@ -19,18 +19,13 @@ BarWidget {
       ? warnColor
       : (bar ? bar.barForeground : Color.foreground)
 
-  readonly property string barMetric: {
-    var value = setting("barMetric", "p99")
-    return value ? String(value) : "p99"
-  }
-  readonly property string pinText: {
-    var rows = panelItem && panelItem.status ? panelItem.status.insightRows : null
-    if (!rows) return ""
-    for (var i = 0; i < rows.length; i++) {
-      if (rows[i] && rows[i].id === barMetric) return rows[i].pin || ""
-    }
-    return ""
-  }
+  readonly property string pinText: panelItem ? panelItem.barPinText : ""
+  readonly property real iconSlot: Style.bar.iconSlot
+  readonly property real pinGap: Style.space(4)
+  // Painted width of the logo slot plus the pinned metric. The bar slot, the
+  // click target, and the open-panel underline all follow this, so the metric
+  // is not drawn in the margin past an icon-sized module.
+  readonly property real contentWidth: iconSlot + (pinText !== "" ? pinGap + pinLabel.implicitWidth : 0)
 
   function open() { if (panelItem) panelItem.open() }
   function close() { if (panelItem) panelItem.close() }
@@ -56,8 +51,14 @@ BarWidget {
   onBarChanged: injectPanel()
   onSettingsChanged: injectPanel()
 
-  implicitWidth: cluster.implicitWidth
-  implicitHeight: cluster.implicitHeight
+  // Replaces the bar's default mark, which is ~55% of the slot and centered
+  // on it. This length is the whole cluster, so the line starts at the logo
+  // and ends at the pinned text.
+  readonly property real openPanelIndicatorWidth: contentWidth
+  readonly property real openPanelIndicatorHeight: Math.max(Style.space(10), Math.round(iconSlot * 0.55))
+
+  implicitWidth: contentWidth
+  implicitHeight: button.implicitHeight
 
   IpcHandler {
     target: "lukascaha.planetscale"
@@ -78,15 +79,31 @@ BarWidget {
     }
   }
 
-  Row {
-    id: cluster
-    spacing: Style.space(4)
+  WidgetButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    tooltipText: panelItem ? panelItem.tooltipText : "PlanetScale"
+    labelVisible: false
+    hasVisualContent: true
+    fixedWidth: root.contentWidth
+    fixedHeight: bar ? bar.barSize : Style.bar.sizeHorizontal
+    onPressed: function(buttonCode) { root.handlePress(buttonCode) }
 
-    BarIconButton {
-      id: iconButton
-      bar: root.bar
-      tooltipText: panelItem ? panelItem.tooltipText : "PlanetScale"
-      iconComponent: Component {
+    Row {
+      id: cluster
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: root.pinText !== "" ? root.pinGap : 0
+      height: parent.height
+      width: root.contentWidth
+
+      Item {
+        implicitWidth: root.iconSlot
+        implicitHeight: parent.height
+        width: root.iconSlot
+        height: parent.height
+
         PlanetScaleLogo {
           anchors.centerIn: parent
           iconSize: Style.bar.iconCanvas
@@ -96,29 +113,16 @@ BarWidget {
           color: root.logoColor
         }
       }
-      onPressed: function(buttonCode) { root.handlePress(buttonCode) }
-    }
-
-    Item {
-      visible: root.pinText !== ""
-      width: pinLabel.implicitWidth
-      height: iconButton.implicitHeight
 
       Text {
         id: pinLabel
+        visible: root.pinText !== ""
         anchors.verticalCenter: parent.verticalCenter
         text: root.pinText
         textFormat: Text.PlainText
         color: root.logoColor
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.bodySmall
-      }
-
-      MouseArea {
-        anchors.fill: parent
-        acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
-        cursorShape: Qt.PointingHandCursor
-        onPressed: function(mouse) { root.handlePress(mouse.button) }
       }
     }
   }

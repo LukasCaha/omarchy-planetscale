@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Shapes
 import qs.Commons
 
-// PlanetScale mark, painted in the bar foreground so it follows the theme.
+// PlanetScale mark from Simple Icons (CC0), painted in the bar foreground.
 Item {
   id: root
 

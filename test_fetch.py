@@ -1,5 +1,7 @@
+import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +14,7 @@ def ready_database(**extra):
         "name": "app",
         "state": "ready",
         "ready": True,
-        "html_url": "https://app.planetscale.com/devops-youklid/app",
+        "html_url": "https://app.planetscale.com/acme/app",
         "resizing": False,
         "resize_queued": False,
         "config_changing": False,
@@ -62,7 +64,7 @@ class PresenceTests(unittest.TestCase):
                 ("planetscale_replica_lag_seconds", [{"role": "replica", "value": 0.4}]),
             ]),
             empty_insights(),
-            "devops-youklid",
+            "acme",
             "main",
         )
         self.assertEqual(payload["tone"], "ok")
@@ -76,7 +78,7 @@ class PresenceTests(unittest.TestCase):
         self.assertNotIn("80%", payload["tooltip"])
         self.assertIn("Replica lag: 0.4s", payload["tooltip"])
         self.assertIn("Query errors: none", payload["tooltip"])
-        self.assertEqual(payload["url"], "https://app.planetscale.com/devops-youklid/app")
+        self.assertEqual(payload["url"], "https://app.planetscale.com/acme/app")
 
     def test_deploy_in_progress(self):
         payload = fetch.compose(
@@ -134,6 +136,10 @@ class PresenceTests(unittest.TestCase):
         self.assertIn("Memory: 67%", payload["tooltip"])
         self.assertIn("Replica lag: 1.2s", payload["tooltip"])
         self.assertIn("Disk: 16 B used, 51 GiB free", payload["tooltip"])
+        pins = {row["id"]: row["pin"] for row in payload["numbers"]}
+        self.assertEqual(pins["cpu"], "cpu 36%")
+        self.assertEqual(pins["lag"], "lag 1.2s")
+        self.assertEqual(pins["disk"], "disk 16 B/51 GiB")
 
     def test_partial_metrics(self):
         payload = fetch.compose(
@@ -206,65 +212,195 @@ class PresenceTests(unittest.TestCase):
         self.assertEqual(by_id["p99"]["pin"], "p99 2.8ms")
         self.assertEqual(by_id["p50"]["value"], "1.1ms")
         self.assertEqual(by_id["qps"]["value"], "4.2/s")
-        self.assertEqual(by_id["qps"]["pin"], "4.2 qps")
+        self.assertEqual(by_id["qps"]["pin"], "qps 4.2/s")
         self.assertEqual(by_id["qpm"]["value"], "255/min")
+        self.assertEqual(by_id["qpm"]["pin"], "qpm 255/min")
         self.assertIn("p99: 2.8ms", payload["tooltip"])
         self.assertNotIn("9999", payload["tooltip"])
+        pins = {row["id"]: row["pin"] for row in payload["numbers"]}
+        self.assertEqual(pins["schema"], "schema 0")
+        self.assertEqual(pins["p99"], "p99 2.8ms")
+        self.assertEqual(pins["cpu"], "")
+        self.assertEqual(pins["errors"], "errors 0")
 
-    def test_env_text_quotes_password(self):
-        text = fetch.env_text("app", {
-            "host": "aws.connect.psdb.cloud",
-            "username": "user",
-            "password": "p@ss word",
-            "database": "app",
-        })
-        self.assertIn("DATABASE_PASSWORD=p@ss word\n", text)
-        self.assertIn("mysql://user:p%40ss%20word@aws.connect.psdb.cloud/app?", text)
-        self.assertNotIn("p@ss word@", text)
-
-    def test_copy_reuses_cached_password_without_creating_another(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "creds.json"
-            os.environ["PS_PLUGIN_CREDENTIAL_FILE"] = str(path)
-            try:
-                copied = []
-
-                def fail_request(*_args, **_kwargs):
-                    raise AssertionError("should reuse the cache")
-
-                original = fetch.request
-                fetch.request = fail_request
-                fetch.write_cache(path, {
-                    "acme/app/main": {
-                        "host": "h.psdb.cloud",
-                        "username": "user",
-                        "password": "secret",
-                        "database": "app",
-                    }
-                })
-                result = fetch.copy_credentials("token", "acme", "app", "main", copier=copied.append)
-            finally:
-                fetch.request = original
-                os.environ.pop("PS_PLUGIN_CREDENTIAL_FILE", None)
-        self.assertTrue(result["ok"])
-        self.assertIn("DATABASE_PASSWORD=secret", copied[0])
-        self.assertNotIn("secret", result["message"])
-
-    def test_copy_reports_missing_password_permission(self):
-        def forbidden(*_args, **_kwargs):
-            raise fetch.ApiError(403, "no", "/passwords")
-
-        original = fetch.request
-        fetch.request = forbidden
+    def test_range_averages_finished_buckets(self):
+        now = 1_000_000
+        original = fetch.time.time
+        fetch.time.time = lambda: now
         try:
-            with tempfile.TemporaryDirectory() as directory:
-                os.environ["PS_PLUGIN_CREDENTIAL_FILE"] = str(Path(directory) / "creds.json")
-                result = fetch.copy_credentials("token", "acme", "app", "main", copier=lambda _text: None)
+            payload = fetch.compose(
+                ready_database(),
+                deploys([]),
+                empty_metrics(),
+                empty_insights(),
+                "acme",
+                "main",
+                {
+                    "ok": True,
+                    "status": 200,
+                    "data": {
+                        "interval": 60,
+                        "series": [
+                            {"metric": "latency_p99", "points": [[now - 180, 10], [now - 120, 30], [now - 10, 90]]},
+                            {"metric": "queries", "points": [[now - 180, 60], [now - 120, 180], [now - 10, 9999]]},
+                        ],
+                    },
+                },
+                "6h",
+            )
+            gauges = fetch.window_gauges({
+                "interval": 60,
+                "series": [
+                    {"metric": "primary_cpu_usage", "points": [[now - 180, 20], [now - 120, 40], [now - 10, 99]]},
+                    {"metric": "replication_lag", "points": [[now - 180, 0], [now - 120, 2], [now - 10, 9]]},
+                ],
+            })
         finally:
-            fetch.request = original
-            os.environ.pop("PS_PLUGIN_CREDENTIAL_FILE", None)
-        self.assertFalse(result["ok"])
-        self.assertIn("connect_production_branch", result["message"])
+            fetch.time.time = original
+        by_id = {row["id"]: row for row in payload["insightRows"]}
+        self.assertEqual(by_id["p99"]["value"], "20ms")
+        self.assertEqual(by_id["qps"]["value"], "2/s")
+        self.assertEqual(payload["period"], "6h")
+        self.assertEqual(fetch.normalize_period("nope"), "1h")
+        cpu = gauges[0]["values"][0]["value"]
+        lag = gauges[1]["values"][0]["value"]
+        self.assertEqual(cpu, 30)
+        self.assertEqual(lag, 1)
+
+    def test_charts_use_finished_buckets(self):
+        now = 1_000_000
+        original = fetch.time.time
+        fetch.time.time = lambda: now
+        try:
+            metrics_payload = empty_metrics()
+            metrics_payload["tablets"] = {
+                "interval": 60,
+                "series": [
+                    {"metric": "primary_cpu_usage", "points": [[now - 180, 20], [now - 120, 40], [now - 10, 99]]},
+                    {"metric": "primary_memory_usage", "points": [[now - 180, 50], [now - 120, 70], [now - 10, 99]]},
+                ],
+            }
+            payload = fetch.compose(
+                ready_database(),
+                deploys([]),
+                metrics_payload,
+                empty_insights(),
+                "acme",
+                "main",
+                {
+                    "ok": True,
+                    "status": 200,
+                    "data": {
+                        "interval": 60,
+                        "series": [
+                            {"metric": "latency_p50", "points": [[now - 180, 4], [now - 120, 6], [now - 10, 80]]},
+                            {"metric": "latency_p99", "points": [[now - 180, 10], [now - 120, 30], [now - 10, 90]]},
+                            {"metric": "queries", "points": [[now - 180, 60], [now - 120, 180], [now - 10, 9999]]},
+                            {"metric": "queries", "points": [[now - 180, 60], [now - 120, 60], [now - 10, 1]]},
+                        ],
+                    },
+                },
+            )
+            long_points = [[now - (96 - index) * 60, float(index)] for index in range(96)]
+            long_chart = fetch.build_charts(
+                {"interval": 60, "series": [{"metric": "latency_p99", "points": long_points}]},
+                None,
+            )
+        finally:
+            fetch.time.time = original
+        charts = {chart["id"]: chart for chart in payload["charts"]}
+        self.assertEqual([series["id"] for series in charts["latency"]["series"]], ["p50", "p99"])
+        self.assertEqual(charts["latency"]["series"][1]["points"], [10, 30])
+        self.assertEqual(charts["latency"]["unit"], "ms")
+        self.assertEqual(charts["queries"]["series"][0]["points"], [2, 4])
+        self.assertEqual(charts["queries"]["unit"], "/s")
+        self.assertEqual(charts["host"]["scale"], "percent")
+        self.assertEqual(charts["host"]["series"][0]["points"], [50, 70])
+        self.assertEqual(charts["host"]["series"][1]["points"], [20, 40])
+        self.assertEqual(fetch.compose(ready_database(), deploys([]), empty_metrics(), empty_insights(), "acme", "main")["charts"], [])
+        reduced = long_chart[0]["series"][0]["points"]
+        self.assertEqual(len(reduced), 48)
+        self.assertEqual(reduced[0], 0.5)
+        self.assertEqual(reduced[-1], 94.5)
+
+    def test_branch_numbers_can_be_pinned(self):
+        payload = fetch.compose(
+            ready_database(open_schema_recommendations_count=28),
+            deploys([]),
+            {
+                "ok": True,
+                "status": 200,
+                "data": {
+                    "metrics": [
+                        {"metric": "primary_cpu_usage", "values": [{"value": 48}]},
+                        {"metric": "primary_memory_usage", "values": [{"value": 67}]},
+                        {"metric": "replication_lag", "values": [{"value": 0}]},
+                    ],
+                    "disk_used_bytes": 16,
+                    "disk_free_bytes": 54757998592,
+                },
+            },
+            insights([
+                {"error_count": 1, "normalized_sql": "select 1"},
+                {"error_count": 1, "normalized_sql": "select 2"},
+                {"error_count": 1, "normalized_sql": "select 3"},
+                {"error_count": 1, "normalized_sql": "select 4"},
+            ]),
+            "acme",
+            "main",
+        )
+        pins = {row["id"]: row for row in payload["numbers"]}
+        self.assertEqual(pins["schema"]["pin"], "schema 28")
+        self.assertEqual(pins["cpu"]["pin"], "cpu 48%")
+        self.assertEqual(pins["memory"]["pin"], "mem 67%")
+        self.assertEqual(pins["lag"]["pin"], "lag 0s")
+        self.assertEqual(pins["disk"]["pin"], "disk 16 B/51 GiB")
+        self.assertEqual(pins["connections"]["pin"], "")
+        self.assertEqual(pins["errors"]["pin"], "errors 4")
+        self.assertFalse(payload["needsToken"])
+
+    def test_save_token_writes_a_private_file_and_hides_the_secret(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bar-token"
+            secret = "id123:super-secret-value"
+            fetch.save_token(path, "  " + secret + "\n")
+            self.assertEqual(path.read_text(encoding="utf-8"), secret + "\n")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(fetch.load_token(path), secret)
+            with self.assertRaises(fetch.ConfigError):
+                fetch.save_token(path, "not a token")
+            self.assertEqual(path.read_text(encoding="utf-8"), secret + "\n")
+            os.environ["PS_PLUGIN_TOKEN_FILE"] = str(path)
+            os.environ["PS_PLUGIN_TOKEN_VALUE"] = secret
+            try:
+                raw = self._capture_main(["fetch.py", "--save-token"])
+            finally:
+                os.environ.pop("PS_PLUGIN_TOKEN_FILE", None)
+                os.environ.pop("PS_PLUGIN_TOKEN_VALUE", None)
+        self.assertNotIn("super-secret-value", raw)
+        self.assertTrue(json.loads(raw)["ok"])
+
+    def test_missing_token_asks_for_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing-token"
+            os.environ["PS_PLUGIN_TOKEN_FILE"] = str(missing)
+            try:
+                payload = json.loads(self._capture_main(["fetch.py", "acme", "app", "main"]))
+            finally:
+                os.environ.pop("PS_PLUGIN_TOKEN_FILE", None)
+        self.assertTrue(payload["needsToken"])
+        self.assertIn("No service token", payload["error"])
+
+    def _capture_main(self, argv):
+        from io import StringIO
+        original = sys.stdout
+        buffer = StringIO()
+        sys.stdout = buffer
+        try:
+            fetch.main(argv)
+        finally:
+            sys.stdout = original
+        return buffer.getvalue()
 
     def test_unauthorized(self):
         self.assertIn("Unauthorized", fetch.database_error(401))

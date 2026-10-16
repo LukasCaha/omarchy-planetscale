@@ -1,13 +1,14 @@
-# PlanetScale bar plugin
+# PlanetScale
 
-PlanetScale logo for the [Omarchy](https://omarchy.org) bar. Click the logo to open a panel with:
+PlanetScale status for the [Omarchy](https://omarchy.org) bar. Click the logo, or a metric pinned beside it, to open the panel.
 
-- database state, deploy requests, and branch metrics
-- branch-wide latency (p50, p95, p99, p99.9, max) and query rate (QPS and QPM) for the last full minute
-- query errors
-- a **Copy host, user, and password** action that puts a `.env` block on the clipboard
+![PlanetScale panel](preview.png)
 
-Right-click opens the database in the browser. Middle-click refreshes. In the panel, `r` refreshes, `c` copies credentials, `o` opens the browser, and `Esc` closes it.
+The panel shows database state, open deploy requests, branch metrics, and query errors. Latency, query rate, CPU, memory, and replica lag are averages over `15m`, `1h`, `6h`, `1d`, or `7d`, so one busy minute does not move the numbers. The same range draws a chart with tabs for latency (p50, p95, p99), queries per second, and CPU with memory. Hover a point to read that sample. The open bucket is left out of both the averages and the lines.
+
+Right-click opens the database in the browser. Middle-click refreshes. In the panel, `r` refreshes, `o` opens the browser, and `Esc` closes it.
+
+Click any number in the panel to pin it beside the logo. Click it again to unpin it. Two numbers at most. A third pin replaces the older one. The choice is saved as `barMetrics` in `shell.json`. An older `barMetric` value is still read until you change the pins. The range is saved as `metricPeriod`.
 
 ## Install
 
@@ -15,9 +16,15 @@ Right-click opens the database in the browser. Middle-click refreshes. In the pa
 omarchy plugin add https://github.com/LukasCaha/omarchy-planetscale --enable
 ```
 
-`barMetric` is the number after the logo: `p50`, `p95`, `p99`, `p999`, `max`, `qps`, or `qpm`.
+The plugin id is `lukascaha.planetscale`. It starts on the right side of the bar. Move it with:
 
-The plugin id is `lukascaha.planetscale`. Set your database on that entry in `~/.config/omarchy/shell.json`:
+```bash
+omarchy bar move lukascaha.planetscale --section right
+```
+
+## Configure
+
+Set your database on that entry in `~/.config/omarchy/shell.json`:
 
 ```json
 {
@@ -26,17 +33,26 @@ The plugin id is `lukascaha.planetscale`. Set your database on that entry in `~/
   "database": "your-database",
   "branch": "main",
   "refreshIntervalSec": 60,
-  "barMetric": "p99"
+  "barMetrics": ["p99", "qps"],
+  "metricPeriod": "1h"
 }
 ```
 
+`organization` and `database` are the slugs from the PlanetScale URL. `branch` defaults to `main`.
+
 ## Service token
 
-The token stays out of this repo. Create `~/.config/planetscale/bar-token` with one line, `TOKEN_ID:TOKEN`, then run `chmod 600` on that file.
+Create a PlanetScale service token with `read_database`, `read_branch`, and `read_deploy_request`.
 
-The token needs `read_database`, `read_branch`, and `read_deploy_request`. Copying credentials also needs `connect_production_branch` or `connect_branch`, because PlanetScale only returns a password when it is created.
+Save it as one line, `TOKEN_ID:TOKEN`, in `~/.config/planetscale/bar-token`, then run `chmod 600` on that file. If the file is missing, or PlanetScale refuses it, the panel asks you to paste the token and saves it there with mode 600. The token is not stored in this repository. `PS_PLUGIN_TOKEN_FILE` overrides the path.
 
-The first copy creates a `readwriter` password named `omarchy-bar` and stores it in `~/.config/planetscale/bar-credentials.json` (mode 600). Later copies reuse that file. PlanetScale will not show the password again. Delete the file to create a new one.
+## Remove
+
+```bash
+omarchy plugin remove lukascaha.planetscale
+```
+
+Removing the plugin leaves `~/.config/planetscale/bar-token` in place. Delete that file yourself if you want the token gone.
 
 ## Development
 
